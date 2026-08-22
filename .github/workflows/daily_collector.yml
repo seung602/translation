@@ -1,121 +1,70 @@
-name: Daily Collector
+name: Translate DB
 
 on:
-  # schedule:
-  #   - cron: '0 1 * * *'  # 자체 실행 비활성화 (cron-job.org가 외부 트리거)
   workflow_dispatch:
+    inputs:
+      max_items:
+        description: "테스트할 때만 숫자 입력 (예: 50), 전체 번역은 비워두기"
+        required: false
+        default: ""
+      batch_size:
+        description: "한 번에 번역할 상품명 수 (무료 한도 고려 시 50 추천)"
+        required: false
+        default: "50"
+      model:
+        description: "Gemini model (예: gemini-1.5-flash-latest 또는 gemini-2.0-flash-exp)"
+        required: false
+        default: "gemini-1.5-flash-latest"
 
 jobs:
-  collect:
+  translate:
     runs-on: ubuntu-latest
-    timeout-minutes: 70
+    timeout-minutes: 360
+
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ github.event.inputs.model }}
+      TRANSLATE_ENABLED: "1"
+      TRANSLATE_BATCH_SIZE: ${{ github.event.inputs.batch_size }}
+      TRANSLATE_MAX_PER_RUN: "1000000"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          lfs: true
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+      - name: Fail if GEMINI_API_KEY is missing
+        env:
+          KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "❌ GitHub Secrets에 GEMINI_API_KEY가 없습니다."
+            exit 1
+          fi
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Cache Playwright Browsers
-        uses: actions/cache@v4
-        id: playwright-cache
+      - name: Run translation
+        run: |
+          if [ -z "${{ github.event.inputs.max_items }}" ]; then
+            echo "전체 번역을 시작합니다."
+            python translate_service.py --force-all
+          else
+            echo "테스트 번역을 시작합니다: ${{ github.event.inputs.max_items }}개"
+            python translate_service.py --force-all --max-items "${{ github.event.inputs.max_items }}"
+          fi
+
+      - name: Upload translated DB
+        uses: actions/upload-artifact@v4
         with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-playwright-
-
-      - name: Install Playwright Browsers
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: playwright install chromium
-
-      - name: Run daily collection script
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python run_daily.py 2>&1 | tee run_log.txt
-
-      - name: Optimize SQLite Database
-        run: |
-          python -c "
-          import sqlite3
-          conn = sqlite3.connect('beauty_catalog.db')
-          conn.execute('PRAGMA wal_checkpoint(TRUNCATE);')
-          conn.execute('VACUUM;')
-          conn.close()
-          "
-
-      - name: Commit and push changes
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          echo "run_log.txt" >> .gitignore
-          git add .
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update daily trend data" && git push)
-
-      - name: Trigger Render Deployment
-        env:
-          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
-        run: |
-          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
-            echo "RENDER_DEPLOY_HOOK_URL 시크릿이 없어 배포를 건너뜁니다."
-          else
-            curl -fsS -X POST "$RENDER_DEPLOY_HOOK_URL"
-          fi
-
-      - name: Send Telegram Notification
-        if: always()
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          STATUS="${{ job.status }}"
-
-          # ✅ run_daily.py가 남기는 고정 포맷 "METRIC KEY=값" 라인을 grep해서 읽는다.
-          # (기존에는 자유 형식 한국어 로그 문장을 grep해서 로그 문구가 바뀌면 계속 깨졌음)
-          get_metric() {
-            if [ -f run_log.txt ]; then
-              grep -oE "METRIC $1=[0-9]+" run_log.txt | tail -1 | cut -d= -f2
-            fi
-          }
-
-          OY_CATALOG=$(get_metric OY_CATALOG_COLLECTED)
-          OY_NEW=$(get_metric OY_CATALOG_NEW)
-          OY_RANKING=$(get_metric OY_RANKING_SAVED)
-          DAISO_CATALOG=$(get_metric DAISO_CATALOG_COLLECTED)
-          DAISO_NEW=$(get_metric DAISO_CATALOG_NEW)
-
-          OY_CATALOG=${OY_CATALOG:-"확인불가"}
-          OY_NEW=${OY_NEW:-"확인불가"}
-          OY_RANKING=${OY_RANKING:-"확인불가"}
-          DAISO_CATALOG=${DAISO_CATALOG:-"확인불가"}
-          DAISO_NEW=${DAISO_NEW:-"확인불가"}
-
-          if [ "$STATUS" = "success" ]; then
-            MSG="✅ 수집 및 DB 백업 정상 완료"
-          else
-            MSG="❌ 수집 중 오류 발생! GitHub 로그 확인"
-          fi
-
-          TEXT=$(printf '🤖 일일 뷰티 트렌드 봇\n\n🏪 올리브영\n  · 카탈로그 수집: %s개 (신규 %s개)\n  · 랭킹 저장: %s개\n\n🏬 다이소\n  · 카탈로그 수집: %s개 (신규 %s개)\n\n💬 %s' \
-            "$OY_CATALOG" "$OY_NEW" "$OY_RANKING" "$DAISO_CATALOG" "$DAISO_NEW" "$MSG")
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=${TEXT}"
+          name: translated-beauty-catalog
+          path: beauty_catalog.db
+          if-no-files-found: error
+          retention-days: 14
